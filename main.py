@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from models import SubmissionCreate, SubmissionCheck, UserRole
 
 # ПРИНУДИТЕЛЬНАЯ загрузка .env ПЕРВОЙ строкой
 load_dotenv()
@@ -55,23 +56,21 @@ async def register(user_data: UserCreate):
     try:
         user_dict = auth_service.create_user(user_data)
         
-        # Создаем токен с правильными данными
         access_token = auth_service.create_access_token(
             data={
-                "sub": str(user_dict["id"]),  # user_id как строка
+                "sub": str(user_dict["id"]),
                 "username": user_dict["username"]
             }
         )
         
-        # Возвращаем полный ответ
         return {
             "access_token": access_token,
             "token_type": "bearer",
             "user_id": user_dict["id"],
             "username": user_dict["username"],
-            "display_name": user_dict["display_name"]
+            "display_name": user_dict["display_name"],
+            "role": user_data.role.value  # возвращаем роль
         }
-        
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -89,17 +88,21 @@ async def login(login_data: UserLogin):
     # Создаем токен
     access_token = auth_service.create_access_token(
         data={
-            "sub": str(user.id),  # user_id как строка
+            "sub": str(user.id),
             "username": user.username
         }
     )
+    
+    # Получаем роль пользователя
+    user_role = db.get_user_role(user.id)
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
         "user_id": user.id,
         "username": user.username,
-        "display_name": user.display_name
+        "display_name": user.display_name,
+        "role": user_role  
     }
 
 @app.get("/auth/verify-token")
@@ -126,11 +129,15 @@ async def get_current_user_info(current_user: TokenData = Depends(get_current_us
     user = auth_service.get_user_by_username(current_user.username)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    role = db.get_user_role(user['id'])
+    
     return {
-        "id": user.id,
-        "username": user.username,
-        "display_name": user.display_name,
-        "created_at": user.created_at
+        "id": user['id'],
+        "username": user['username'],
+        "display_name": user.get('display_name'),
+        "role": role,
+        "created_at": user.get('created_at')
     }
 
 @app.get("/auth/verify")
@@ -143,11 +150,120 @@ async def verify_token(current_user: TokenData = Depends(get_current_user)):
         "message": "Token is valid"
     }
 
+# ===== ЭНДПОИНТЫ ДЛЯ СТУДЕНТОВ =====
+
+@app.post("/subjects/{subject_id}/subscribe")
+async def subscribe_to_subject(
+    subject_id: int,
+    current_user: TokenData = Depends(get_current_user)
+):
+    """Студент подписывается на предмет"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'student':
+        raise HTTPException(status_code=403, detail="Only students can subscribe to subjects")
+    
+    success = db.subscribe_student_to_subject(current_user.user_id, subject_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to subscribe")
+    
+    return {"message": "Successfully subscribed to subject"}
+
+@app.delete("/subjects/{subject_id}/unsubscribe")
+async def unsubscribe_from_subject(
+    subject_id: int,
+    current_user: TokenData = Depends(get_current_user)
+):
+    """Студент отписывается от предмета"""
+    success = db.unsubscribe_student_from_subject(current_user.user_id, subject_id)
+    return {"message": "Unsubscribed" if success else "Was not subscribed"}
+
+@app.get("/student/subjects", response_model=List[Subject])
+async def get_student_subjects(current_user: TokenData = Depends(get_current_user)):
+    """Получить предметы, на которые подписан студент"""
+    return db.get_student_subjects(current_user.user_id)
+
+@app.post("/tasks/{task_id}/submit")
+async def submit_task(
+    task_id: int,
+    submission: SubmissionCreate,
+    current_user: TokenData = Depends(get_current_user)
+):
+    """Студент отправляет решение задачи"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'student':
+        raise HTTPException(status_code=403, detail="Only students can submit tasks")
+    
+    result = db.create_submission(current_user.user_id, submission)
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return {"message": "Task submitted successfully", "submission_id": result['id']}
+
+@app.get("/student/submissions")
+async def get_student_submissions(current_user: TokenData = Depends(get_current_user)):
+    """Студент видит свои отправленные задания и их статус"""
+    return db.get_student_submissions(current_user.user_id)
+
+# ===== ЭНДПОИНТЫ ДЛЯ УЧИТЕЛЕЙ =====
+
+@app.get("/teacher/subjects", response_model=List[Subject])
+async def get_teacher_subjects(current_user: TokenData = Depends(get_current_user)):
+    """Учитель видит свои предметы"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can view their subjects")
+    
+    return db.get_teacher_subjects(current_user.user_id)
+
+@app.post("/subjects", response_model=Subject, status_code=status.HTTP_201_CREATED)
+async def create_subject(
+    subject: CreateSubject,
+    current_user: TokenData = Depends(get_current_user)
+):
+    """Создать новый учебный предмет (только учитель)"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can create subjects")
+    
+    # Передаём teacher_id при создании
+    return db.create_subject(subject, current_user.user_id)
+
+@app.get("/teacher/pending-submissions")
+async def get_pending_submissions(current_user: TokenData = Depends(get_current_user)):
+    """Учитель видит непроверенные задания"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can check submissions")
+    
+    return db.get_pending_submissions(current_user.user_id)
+
+@app.post("/submissions/{submission_id}/check")
+async def check_submission(
+    submission_id: int,
+    check_data: SubmissionCheck,
+    current_user: TokenData = Depends(get_current_user)
+):
+    """Учитель проверяет задание и ставит оценку"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can check submissions")
+    
+    result = db.check_submission(submission_id, check_data, current_user.user_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Submission not found or not yours")
+    
+    return {"message": "Submission checked", "submission": result}
+
 # ===== SUBJECTS ENDPOINTS =====
 @app.get("/subjects", response_model=List[Subject])
 async def get_all_subjects(current_user: TokenData = Depends(get_current_user)):
-    """Получить все учебные предметы (только для авторизованных)"""
-    return db.get_all_subjects()
+    """Получить предметы (учитель видит свои, студент - все)"""
+    role = db.get_user_role(current_user.user_id)
+    
+    if role == 'teacher':
+        return db.get_teacher_subjects(current_user.user_id)
+    else:
+        return db.get_all_subjects()
 
 @app.get("/subjects/{subject_id}", response_model=Subject)
 async def get_subject(subject_id: int):
@@ -156,14 +272,6 @@ async def get_subject(subject_id: int):
     if subject is None:
         raise HTTPException(status_code=404, detail="Subject not found")
     return subject
-
-@app.post("/subjects", response_model=Subject, status_code=status.HTTP_201_CREATED)
-async def create_subject(
-    subject: CreateSubject,
-    current_user: TokenData = Depends(get_current_user)
-):
-    """Создать новый учебный предмет (только для авторизованных)"""
-    return db.create_subject(subject)
 
 @app.put("/subjects/{subject_id}", response_model=Subject)
 async def update_subject(subject_id: int, subject_data: UpdateSubject):
@@ -230,23 +338,21 @@ async def delete_practice(practice_id: int):
 @app.patch("/practices/{practice_id}/condition")
 async def update_practice_condition(
     practice_id: int,
-    condition_data: dict  # Принимаем JSON объект
+    condition_data: dict,
+    current_user: TokenData = Depends(get_current_user)  # ← ДОБАВИТЬ
 ):
-    """Обновить статус проверки практики"""
-    # Извлекаем значение condition из JSON
+    """Обновить статус проверки практики (только учитель)"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can change condition")
+    
     condition = condition_data.get("condition")
     
     if not condition:
-        raise HTTPException(
-            status_code=400, 
-            detail="Missing 'condition' field in request body"
-        )
+        raise HTTPException(status_code=400, detail="Missing 'condition' field in request body")
     
     if condition not in ["выполнена", "не выполнена"]:
-        raise HTTPException(
-            status_code=400, 
-            detail="Condition must be 'выполнена' or 'не выполнена'"
-        )
+        raise HTTPException(status_code=400, detail="Condition must be 'выполнена' or 'не выполнена'")
     
     practice = db.update_practice(practice_id, UpdatePractice(condition=condition))
     
@@ -256,8 +362,15 @@ async def update_practice_condition(
     return practice
 
 @app.patch("/practices/{practice_id}/toggle-condition")
-async def toggle_practice_condition(practice_id: int):
-    """Переключить статус проверки практики"""
+async def toggle_practice_condition(
+    practice_id: int,
+    current_user: TokenData = Depends(get_current_user)  # ← ДОБАВИТЬ
+):
+    """Переключить статус проверки практики (только учитель)"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can change condition")
+    
     practice = db.get_practice_by_id(practice_id)
     if practice is None:
         raise HTTPException(status_code=404, detail="Practice not found")
@@ -268,26 +381,37 @@ async def toggle_practice_condition(practice_id: int):
     return updated_practice
 
 @app.patch("/practices/{practice_id}/complete")
-async def complete_practice(practice_id: int):
-    """Отметить практику как выполненную"""
+async def complete_practice(
+    practice_id: int,
+    current_user: TokenData = Depends(get_current_user)  # ← ДОБАВИТЬ
+):
+    """Отметить практику как выполненную (только учитель)"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can complete practices")
+    
     practice = db.complete_practice(practice_id)
     if practice is None:
         raise HTTPException(status_code=404, detail="Practice not found")
     return practice
 
 @app.post("/practices/{practice_id}/toggle")
-async def toggle_practice_status(practice_id: int):
-    """Простой переключатель статуса практики (без тела запроса)"""
+async def toggle_practice_status(
+    practice_id: int,
+    current_user: TokenData = Depends(get_current_user)  # ← ДОБАВИТЬ
+):
+    """Простой переключатель статуса практики (только учитель)"""
+    role = db.get_user_role(current_user.user_id)
+    if role != 'teacher':
+        raise HTTPException(status_code=403, detail="Only teachers can toggle status")
+    
     try:
-        # Получаем текущую практику
         practice = db.get_practice_by_id(practice_id)
         if practice is None:
             raise HTTPException(status_code=404, detail="Practice not found")
         
-        # Определяем новый статус
         new_condition = "выполнена" if practice.condition == "не выполнена" else "не выполнена"
         
-        # Обновляем напрямую в базе данных
         with db.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(

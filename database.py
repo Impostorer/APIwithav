@@ -4,7 +4,12 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 from typing import List, Optional
-from models import Subject, Practice, Task, CreateSubject, CreatePractice, CreateTask, UpdateSubject, UpdatePractice, UpdateTask
+from models import (
+    Subject, Practice, Task, 
+    CreateSubject, CreatePractice, CreateTask, 
+    UpdateSubject, UpdatePractice, UpdateTask,
+    SubmissionCreate, SubmissionCheck  # ← ДОБАВЛЕНО
+)
 
 class PostgreSQLDatabase:
     def __init__(self):
@@ -18,6 +23,15 @@ class PostgreSQLDatabase:
     def _get_current_date(self) -> str:
         """Получить текущую дату в формате YYYY-MM-DD для PostgreSQL"""
         return datetime.now().strftime("%Y-%m-%d")
+
+    # ===== USERS =====
+    def get_user_role(self, user_id: int) -> Optional[str]:
+        """Получить роль пользователя"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+                result = cur.fetchone()
+                return result['role'] if result else None
 
     # ===== SUBJECTS CRUD =====
     def get_all_subjects(self) -> List[Subject]:
@@ -55,7 +69,7 @@ class PostgreSQLDatabase:
             
                 if user_id:
                     cur.execute(
-                        "INSERT INTO subjects (title, practice_count, created_at, user_id) VALUES (%s, %s, %s, %s) RETURNING *",
+                        "INSERT INTO subjects (title, practice_count, created_at, teacher_id) VALUES (%s, %s, %s, %s) RETURNING *",
                         (subject_data.title, 0, current_date, user_id)
                     )
                 else:
@@ -124,6 +138,78 @@ class PostgreSQLDatabase:
                     (subject_id, subject_id)
                 )
                 conn.commit()
+
+    # ===== SUBSCRIPTIONS =====
+    def subscribe_student_to_subject(self, student_id: int, subject_id: int) -> bool:
+        """Подписка студента на предмет"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        """INSERT INTO student_subjects (student_id, subject_id) 
+                        VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING id""",
+                        (student_id, subject_id)
+                    )
+                    conn.commit()
+                    return cur.fetchone() is not None
+                except Exception as e:
+                    print(f"Error subscribing: {e}")
+                    return False
+
+    def unsubscribe_student_from_subject(self, student_id: int, subject_id: int) -> bool:
+        """Отписка студента от предмета"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM student_subjects WHERE student_id = %s AND subject_id = %s",
+                    (student_id, subject_id)
+                )
+                conn.commit()
+                return cur.rowcount > 0
+
+    def get_student_subjects(self, student_id: int) -> List[Subject]:
+        """Получить предметы, на которые подписан студент"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT s.* FROM subjects s
+                    JOIN student_subjects ss ON s.id = ss.subject_id
+                    WHERE ss.student_id = %s
+                    ORDER BY s.id
+                """, (student_id,))
+                results = cur.fetchall()
+                return [Subject(
+                    id=row['id'],
+                    title=row['title'],
+                    practiceCount=row['practice_count'],
+                    createdAt=row['created_at']
+                ) for row in results]
+
+    def get_teacher_subjects(self, teacher_id: int) -> List[Subject]:
+        """Получить предметы, созданные учителем"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM subjects WHERE teacher_id = %s ORDER BY id",
+                    (teacher_id,)
+                )
+                results = cur.fetchall()
+                return [Subject(
+                    id=row['id'],
+                    title=row['title'],
+                    practiceCount=row['practice_count'],
+                    createdAt=row['created_at']
+                ) for row in results]
+
+    def is_student_subscribed(self, student_id: int, subject_id: int) -> bool:
+        """Проверить, подписан ли студент на предмет"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM student_subjects WHERE student_id = %s AND subject_id = %s",
+                    (student_id, subject_id)
+                )
+                return cur.fetchone() is not None
 
     # ===== PRACTICES CRUD =====
     def get_all_practices(self) -> List[Practice]:
@@ -217,7 +303,7 @@ class PostgreSQLDatabase:
 
     def update_practice(self, practice_id: int, practice_data: UpdatePractice) -> Optional[Practice]:
         """Обновить практику"""
-        print(f"DEBUG: Updating practice {practice_id} with data: {practice_data}")  # Добавьте эту строку
+        print(f"DEBUG: Updating practice {practice_id} with data: {practice_data}")
     
         with self.get_connection() as conn:
             with conn.cursor() as cur:
@@ -333,7 +419,7 @@ class PostgreSQLDatabase:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO tasks (practice_id, description, file) VALUES (%s, %s, %s) RETURNING *",
-                    (task_data.idPractice, task_data.description, task_data.file)  # file теперь содержит URL
+                    (task_data.idPractice, task_data.description, task_data.file)
                 )
                 result = cur.fetchone()
                 conn.commit()
@@ -341,7 +427,7 @@ class PostgreSQLDatabase:
                     id=result['id'],
                     idPractice=result['practice_id'],
                     description=result['description'],
-                    file=result['file']  # Это теперь URL файла
+                    file=result['file']
                 )
 
     def update_task(self, task_id: int, task_data: UpdateTask) -> Optional[Task]:
@@ -385,6 +471,87 @@ class PostgreSQLDatabase:
                 cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
                 conn.commit()
                 return cur.rowcount > 0
+
+    # ===== SUBMISSIONS =====
+    def create_submission(self, student_id: int, submission: SubmissionCreate) -> Optional[dict]:
+        """Студент отправляет задание на проверку"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Получаем practice_id из задачи
+                cur.execute("SELECT practice_id FROM tasks WHERE id = %s", (submission.task_id,))
+                task = cur.fetchone()
+                if not task:
+                    return None
+                
+                cur.execute(
+                    """INSERT INTO submissions 
+                    (student_id, task_id, practice_id, file_url, text_answer) 
+                    VALUES (%s, %s, %s, %s, %s) RETURNING *""",
+                    (student_id, submission.task_id, task['practice_id'], 
+                     submission.file_url, submission.text_answer)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return dict(result)
+
+    def check_submission(self, submission_id: int, check_data: SubmissionCheck, teacher_id: int) -> Optional[dict]:
+        """Учитель проверяет задание (только свои предметы)"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Проверяем, что учитель имеет право проверять это задание
+                cur.execute("""
+                    SELECT s.teacher_id 
+                    FROM submissions sb
+                    JOIN practices p ON sb.practice_id = p.id
+                    JOIN subjects s ON p.subject_id = s.id
+                    WHERE sb.id = %s
+                """, (submission_id,))
+                result = cur.fetchone()
+                
+                if not result or result['teacher_id'] != teacher_id:
+                    return None
+                
+                cur.execute(
+                    """UPDATE submissions 
+                    SET score = %s, comment = %s, status = 'checked', checked_at = CURRENT_TIMESTAMP 
+                    WHERE id = %s RETURNING *""",
+                    (check_data.score, check_data.comment, submission_id)
+                )
+                result = cur.fetchone()
+                conn.commit()
+                return dict(result) if result else None
+
+    def get_pending_submissions(self, teacher_id: int) -> List[dict]:
+        """Получить непроверенные задания для учителя"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sb.*, t.description as task_description, 
+                           p.name as practice_name, u.username as student_name
+                    FROM submissions sb
+                    JOIN tasks t ON sb.task_id = t.id
+                    JOIN practices p ON sb.practice_id = p.id
+                    JOIN subjects s ON p.subject_id = s.id
+                    JOIN users u ON sb.student_id = u.id
+                    WHERE s.teacher_id = %s AND sb.status = 'pending'
+                    ORDER BY sb.submitted_at DESC
+                """, (teacher_id,))
+                return [dict(row) for row in cur.fetchall()]
+
+    def get_student_submissions(self, student_id: int) -> List[dict]:
+        """Получить свои отправленные задания (для студента)"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT sb.*, t.description as task_description, 
+                           p.name as practice_name
+                    FROM submissions sb
+                    JOIN tasks t ON sb.task_id = t.id
+                    JOIN practices p ON sb.practice_id = p.id
+                    WHERE sb.student_id = %s
+                    ORDER BY sb.submitted_at DESC
+                """, (student_id,))
+                return [dict(row) for row in cur.fetchall()]
 
 # Создаем глобальный экземпляр базы данных
 db = PostgreSQLDatabase()

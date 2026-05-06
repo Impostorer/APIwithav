@@ -51,16 +51,15 @@ class AuthService:
         try:
             with psycopg2.connect(self.connection_string, cursor_factory=RealDictCursor) as conn:
                 with conn.cursor() as cur:
-                    # Получаем все данные за один запрос
+                    # Получаем все данные за один запрос, включая role
                     cur.execute("""
-                        SELECT id, username, password, display_name, is_active, created_at 
+                        SELECT id, username, password, display_name, is_active, created_at, role 
                         FROM users WHERE username = %s
                     """, (username,))
                     result = cur.fetchone()
                     
                     if result:
-                        print(f"✅ Найден пользователь: {result['username']}")
-                        # Возвращаем словарь
+                        print(f"✅ Найден пользователь: {result['username']}, роль: {result.get('role')}")
                         return dict(result)
                     else:
                         print(f"❌ Пользователь {username} не найден")
@@ -71,6 +70,13 @@ class AuthService:
             import traceback
             print(f"📋 Traceback:\n{traceback.format_exc()}")
             return None
+    
+    def _convert_user_dict(self, user_dict: dict) -> dict:
+        """Конвертирует datetime поля в строки для совместимости с Pydantic"""
+        result = dict(user_dict)
+        if 'created_at' in result and isinstance(result['created_at'], datetime):
+            result['created_at'] = result['created_at'].isoformat()
+        return result
     
     def authenticate_user(self, username: str, password: str) -> Optional[User]:
         """Аутентификация пользователя с простой проверкой пароля"""
@@ -94,6 +100,9 @@ class AuthService:
             
             print(f"✅ Аутентификация успешна для {username}")
             
+            # Конвертируем datetime поля в строки
+            user_dict = self._convert_user_dict(user_dict)
+            
             # Создаем объект User без пароля
             return User(
                 id=user_dict['id'],
@@ -110,66 +119,42 @@ class AuthService:
             return None
     
     def create_user(self, user_data: UserCreate) -> User:
-        """Создать нового пользователя (пароль сохраняется в чистом виде)"""
-        print("="*50)
-        print("🚀 НАЧАЛО РЕГИСТРАЦИИ")
-        print(f"📝 Данные пользователя: {user_data}")
-        print(f"📝 Username: {user_data.username}")
-        print(f"📝 Password length: {len(user_data.password)}")
-        print(f"📝 Display name: {user_data.display_name}")
-    
-        try:
-            print(f"🔍 Регистрация пользователя: {user_data.username}")
+        """Создать нового пользователя с ролью"""
+        print(f"📝 Создание пользователя: {user_data.username} с ролью {user_data.role}")
         
+        try:
             with psycopg2.connect(self.connection_string, cursor_factory=RealDictCursor) as conn:
                 with conn.cursor() as cur:
                     # Проверяем, существует ли пользователь
                     cur.execute("SELECT id FROM users WHERE username = %s", (user_data.username,))
-                    existing_user = cur.fetchone()
-                    print(f"🔍 Проверка существующего пользователя: {existing_user}")
-                
-                    if existing_user:
-                        print(f"❌ Пользователь {user_data.username} уже существует")
+                    if cur.fetchone():
                         raise HTTPException(status_code=400, detail="Username already exists")
                 
-                    print(f"💾 Сохраняем пользователя {user_data.username} в БД")
-                    # Сохраняем пароль в чистом виде
+                    # Сохраняем с ролью
                     cur.execute(
-                        """INSERT INTO users (username, password, display_name) 
-                        VALUES (%s, %s, %s) RETURNING id, username, display_name, is_active, created_at""",
-                        (user_data.username, user_data.password, user_data.display_name)
+                        """INSERT INTO users (username, password, display_name, role) 
+                        VALUES (%s, %s, %s, %s) 
+                        RETURNING id, username, display_name, is_active, created_at""",
+                        (user_data.username, user_data.password, 
+                        user_data.display_name, user_data.role.value)
                     )
                     result = cur.fetchone()
-                    print(f"🔍 Результат INSERT: {result}")
                     conn.commit()
-            
-                    print(f"✅ Пользователь {user_data.username} успешно создан, ID: {result['id']}")
-                    print("="*50)
-                    return User(**result)
-            
-        except HTTPException:
-            print("🔥 HTTPException перехвачена")
-            raise
-        except Exception as e:
-            print(f"🔥 КРИТИЧЕСКАЯ ОШИБКА при создании пользователя: {e}")
-            print(f"📋 Тип ошибки: {type(e).__name__}")
-            import traceback
-            print(f"🔍 Traceback:\n{traceback.format_exc()}")
-            print("="*50)
-    
-            error_detail = str(e)
-            raise HTTPException(status_code=500, detail=error_detail)
-                
+                    
+                    print(f"✅ Пользователь {user_data.username} создан с ID: {result['id']}")
+                    
+                    # Конвертируем datetime поля в строки
+                    user_dict = self._convert_user_dict(dict(result))
+                    
+                    return User(**user_dict)
+                    
         except HTTPException:
             raise
         except Exception as e:
-            print(f"🔥 КРИТИЧЕСКАЯ ОШИБКА при создании пользователя: {e}")
-            print(f"📋 Тип ошибки: {type(e).__name__}")
+            print(f"🔥 Ошибка создания пользователя: {e}")
             import traceback
-            print(f"🔍 Traceback:\n{traceback.format_exc()}")
-        
-            error_detail = str(e)
-            raise HTTPException(status_code=500, detail=error_detail)
+            print(f"📋 Traceback:\n{traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
     
     def delete_user_session(self, token: str) -> bool:
         """Удаляем сессию (при выходе)"""
